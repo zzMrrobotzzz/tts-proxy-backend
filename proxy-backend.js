@@ -1,158 +1,68 @@
-// Simple backend proxy for TTS APIs (ElevenLabs, Google Cloud, Amazon Polly)
-// Deployable on Render
 const express = require('express');
+const fetch = require('node-fetch');
 const cors = require('cors');
-const axios = require('axios');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 app.use(cors());
-app.use(express.json({limit: '2mb'}));
+app.use(express.json());
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString() });
-});
+const PORT = process.env.PORT || 3001;
 
-// Test endpoint for debugging
-app.post('/test', (req, res) => {
-  console.log('🧪 Test endpoint called with:', req.body);
-  res.json({ 
-    message: 'Backend is working!', 
-    receivedData: req.body,
-    timestamp: new Date().toISOString()
-  });
-});
+app.post('/api/generate', async (req, res) => {
+    const { apiKey, text, voiceId, model_id, voice_settings, proxies } = req.body;
 
-// Helper: get proxy config for axios
-function getProxyConfig(proxyUrl) {
-  if (!proxyUrl) return {};
-  const { URL } = require('url');
-  const HttpsProxyAgent = require('https-proxy-agent');
-  const agent = new HttpsProxyAgent(proxyUrl);
-  return { httpsAgent: agent, proxy: false };
-}
-
-// Proxy endpoint for ElevenLabs
-app.post('/api/elevenlabs', async (req, res) => {
-  console.log('📥 ElevenLabs request received:', {
-    hasApiKey: !!req.body.apiKey,
-    textLength: req.body.text?.length,
-    voiceId: req.body.voiceId,
-    modelId: req.body.modelId,
-    hasProxy: !!req.body.proxy
-  });
-  
-  const { apiKey, text, voiceId, modelId, voiceSettings, proxy } = req.body;
-  
-  if (!apiKey || !text || !voiceId) {
-    console.error('❌ Missing required params:', { hasApiKey: !!apiKey, hasText: !!text, hasVoiceId: !!voiceId });
-    return res.status(400).json({error: 'Missing required parameters: apiKey, text, voiceId'});
-  }
-  
-  try {
-    const axiosConfig = {
-      ...getProxyConfig(proxy),
-      headers: {
-        'xi-api-key': apiKey,
-        'Content-Type': 'application/json',
-      },
-      responseType: 'arraybuffer',
-    };
-    
-    const apiUrl = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
-    const data = {
-      text,
-      model_id: modelId || 'eleven_multilingual_v2',
-      voice_settings: voiceSettings || undefined,
-    };
-    
-    console.log('🌐 Calling ElevenLabs API:', {
-      url: apiUrl,
-      modelId: data.model_id,
-      hasVoiceSettings: !!data.voice_settings,
-      proxy: proxy || 'none'
-    });
-    
-    const resp = await axios.post(apiUrl, data, axiosConfig);
-    
-    console.log('✅ ElevenLabs API success, response size:', resp.data.length);
-    res.set('Content-Type', 'audio/mpeg');
-    res.send(resp.data);
-    
-  } catch (err) {
-    console.error('❌ ElevenLabs API error:', {
-      message: err.message,
-      status: err.response?.status,
-      statusText: err.response?.statusText,
-      data: err.response?.data
-    });
-    
-    let errorMessage = err.message || 'Proxy error';
-    let statusCode = 500;
-    
-    if (err.response) {
-      statusCode = err.response.status;
-      if (err.response.data) {
-        try {
-          const errorData = JSON.parse(err.response.data.toString());
-          errorMessage = errorData.detail?.message || errorData.message || errorMessage;
-        } catch (e) {
-          errorMessage = err.response.data.toString() || errorMessage;
-        }
-      }
+    if (!apiKey || !text || !voiceId || !proxies || !Array.isArray(proxies) || proxies.length === 0) {
+        return res.status(400).json({ message: 'Thiếu thông tin cần thiết: apiKey, text, voiceId, và danh sách proxies.' });
     }
-    
-    res.status(statusCode).json({
-      error: errorMessage,
-      detail: {
-        message: errorMessage,
-        status: statusCode,
-        originalError: err.message
-      }
-    });
-  }
+
+    try {
+        // Chọn ngẫu nhiên một proxy từ danh sách
+        const randomProxy = proxies[Math.floor(Math.random() * proxies.length)];
+        console.log(`Sử dụng proxy: ${randomProxy}`);
+        const agent = new HttpsProxyAgent(randomProxy);
+
+        const elevenLabsUrl = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+        const elevenLabsBody = {
+            text,
+            model_id: model_id || 'eleven_multilingual_v2',
+            voice_settings: voice_settings || {
+                stability: 0.75,
+                similarity_boost: 0.75,
+            },
+        };
+
+        const elevenLabsResponse = await fetch(elevenLabsUrl, {
+            method: 'POST',
+            headers: {
+                'xi-api-key': apiKey,
+                'Content-Type': 'application/json',
+                'Accept': 'audio/mpeg',
+            },
+            body: JSON.stringify(elevenLabsBody),
+            agent: agent, // Sử dụng proxy agent
+        });
+
+        // Chuyển tiếp header từ ElevenLabs về client
+        res.setHeader('Content-Type', elevenLabsResponse.headers.get('content-type'));
+        res.setHeader('Content-Length', elevenLabsResponse.headers.get('content-length'));
+        res.setHeader('Request-Id', elevenLabsResponse.headers.get('request-id'));
+
+        if (!elevenLabsResponse.ok) {
+             const errorData = await elevenLabsResponse.json().catch(() => ({ message: 'Lỗi không xác định từ ElevenLabs' }));
+             console.error(`Lỗi từ ElevenLabs: ${elevenLabsResponse.status}`, errorData);
+             return res.status(elevenLabsResponse.status).json(errorData);
+        }
+
+        // Stream audio trực tiếp về client
+        elevenLabsResponse.body.pipe(res);
+
+    } catch (error) {
+        console.error('Lỗi proxy hoặc kết nối:', error);
+        res.status(502).json({ message: 'Lỗi khi kết nối qua proxy.', error: error.message });
+    }
 });
 
-// Proxy endpoint for Google Cloud TTS
-app.post('/api/google', async (req, res) => {
-  const { apiKey, input, voice, audioConfig, proxy } = req.body;
-  if (!apiKey || !input || !voice || !audioConfig) return res.status(400).json({error: 'Missing params'});
-  try {
-    const axiosConfig = {
-      ...getProxyConfig(proxy),
-      headers: { 'Content-Type': 'application/json' },
-    };
-    const apiUrl = `https://texttospeech.googleapis.com/v1/text:synthesize?key=${apiKey}`;
-    const data = { input, voice, audioConfig };
-    const resp = await axios.post(apiUrl, data, axiosConfig);
-    res.json(resp.data);
-  } catch (err) {
-    res.status(500).json({error: err.message || 'Proxy error'});
-  }
-});
-
-// Proxy endpoint for Amazon Polly
-app.post('/api/amazon', async (req, res) => {
-  const { accessKeyId, secretAccessKey, region, text, voiceId, proxy } = req.body;
-  if (!accessKeyId || !secretAccessKey || !region || !text || !voiceId) return res.status(400).json({error: 'Missing params'});
-  try {
-    // Use AWS SDK v3 for Polly
-    const { PollyClient, SynthesizeSpeechCommand } = require('@aws-sdk/client-polly');
-    const client = new PollyClient({ region, credentials: { accessKeyId, secretAccessKey } });
-    const command = new SynthesizeSpeechCommand({
-      OutputFormat: 'mp3',
-      Text: text,
-      VoiceId: voiceId,
-    });
-    const data = await client.send(command);
-    res.set('Content-Type', 'audio/mpeg');
-    data.AudioStream.pipe(res);
-  } catch (err) {
-    res.status(500).json({error: err.message || 'Proxy error'});
-  }
-});
-
-const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log('Proxy backend listening on port', PORT);
-}); 
+    console.log(`Máy chủ proxy đang chạy tại cổng ${PORT}`);
+});
